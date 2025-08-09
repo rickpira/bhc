@@ -21,7 +21,7 @@ st.divider()
 
 # ============== ESTADO PERSISTENTE ==============
 if "res" not in st.session_state:
-    st.session_state.res = None  # guardará resultados do cálculo
+    st.session_state.res = None
 
 # ============== CONSTANTES ==============
 MESES = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
@@ -296,19 +296,33 @@ def afericao_ok(df, tol=0.2):
     ]
     return all(checks)
 
-# ===== Classificação Thornthwaite (com ETo_verao/ETo_ano) =====
+# ===== Classificação Thornthwaite (com segunda letra pela sua tabela) =====
 def class_thornthwaite(df, lat):
-    soma_ETo = float(df["ETo (Thornthwaite) (mm)"].sum())
-    soma_EXC = float(df["EXC (mm)"].sum())
-    soma_DEF = float(df["DEF (mm)"].sum())
+    """
+    1) Letra principal (umidade) por Im = Ih - 0.6*Ia
+    2) Segunda letra:
+       - Se (A, B, C2) → usar Ia: r | s/w | s2/w2
+       - Se (C1, D, E) → usar Ih: d | s/w | s2/w2
+       (s vs w decidido pela estação com maior déficit (úmidos) ou maior excedente (secos)).
+    3) Métrica adicional: ETo_verão/ETo_ano (fração).
+    """
+    # Totais anuais
+    ETo = df["ETo (Thornthwaite) (mm)"].to_numpy(float)
+    DEF = df["DEF (mm)"].to_numpy(float)
+    EXC = df["EXC (mm)"].to_numpy(float)
+    PET = float(ETo.sum())
+    soma_DEF = float(DEF.sum())
+    soma_EXC = float(EXC.sum())
 
-    if soma_ETo <= 0:
+    # Índices percentuais (0..100)
+    if PET <= 0:
         Ih = Ia = Im = np.nan
     else:
-        Ih = 100.0 * (soma_EXC / soma_ETo)
-        Ia = 100.0 * (soma_DEF / soma_ETo)
+        Ih = 100.0 * (soma_EXC / PET)
+        Ia = 100.0 * (soma_DEF / PET)
         Im = Ih - 0.6 * Ia
 
+    # Letra principal (umidade) por Im
     def umidade(Im):
         if np.isnan(Im): return ("Indef","Indefinido")
         if Im >= 100:  return ("A","Perúmido")
@@ -322,14 +336,45 @@ def class_thornthwaite(df, lat):
         return ("E","Árido")
     u_code, u_desc = umidade(Im)
 
-    # Verão por hemisfério
-    is_summer = np.isin(np.arange(12), [11,0,1]) if lat < 0 else np.isin(np.arange(12), [5,6,7])
-    ETo = df["ETo (Thornthwaite) (mm)"].to_numpy(float)
-    ETo_verao = float(ETo[is_summer].sum())
-    PET = soma_ETo
-    ETo_verao_sobre_ano = np.nan if PET <= 0 else ETo_verao / PET  # fração 0..1
+    # Meses de verão/inverno por hemisfério
+    # (verão: Dez-Jan-Fev no Sul; Jun-Jul-Ago no Norte)
+    idx_verao = np.array([11,0,1]) if lat < 0 else np.array([5,6,7])
+    idx_inverno = np.array([5,6,7]) if lat < 0 else np.array([11,0,1])
 
-    # Térmico (por PET anual) — mantido
+    # Segunda letra conforme sua Tabela 2
+    def segunda_letra(u_code, Ia, Ih, DEF, EXC):
+        if u_code in ["A","B4","B3","B2","B1","C2"]:
+            # Climas Úmidos → usar Ia
+            ia = Ia if not np.isnan(Ia) else 0.0
+            def_ver = float(DEF[idx_verao].sum())
+            def_inv = float(DEF[idx_inverno].sum())
+            est = "s" if def_ver >= def_inv else "w"
+            if ia < 16.7:
+                return "r", "sem ou pequena deficiência hídrica"
+            elif ia < 33.3:
+                return est, f"deficiência hídrica moderada no {'verão' if est=='s' else 'inverno'}"
+            else:
+                return est + "2", f"grande deficiência hídrica no {'verão' if est=='s' else 'inverno'}"
+        else:
+            # Climas Secos (C1, D, E) → usar Ih
+            ih = Ih if not np.isnan(Ih) else 0.0
+            exc_ver = float(EXC[idx_verao].sum())
+            exc_inv = float(EXC[idx_inverno].sum())
+            est = "s" if exc_ver >= exc_inv else "w"
+            if ih < 10:
+                return "d", "excedente hídrico pequeno ou nulo"
+            elif ih < 20:
+                return est, f"excedente hídrico moderado no {'verão' if est=='s' else 'inverno'}"
+            else:
+                return est + "2", f"grande excedente hídrico no {'verão' if est=='s' else 'inverno'}"
+
+    saz_code, saz_desc = segunda_letra(u_code, Ia, Ih, DEF, EXC)
+
+    # Métrica adicional: ETo_verão/ETo_ano
+    ETo_verao = float(ETo[idx_verao].sum())
+    ETo_verao_sobre_ano = np.nan if PET <= 0 else ETo_verao / PET
+
+    # Tipo térmico clássico por PET anual (mantido)
     def term(PET):
         if np.isnan(PET): return ("Indef","Indefinido")
         if PET >= 1140:  return ("A’","Megatérmico")
@@ -343,17 +388,16 @@ def class_thornthwaite(df, lat):
         return ("E’","Gelo perpétuo")
     t_code, t_desc = term(PET)
 
-    # Fórmula SEM o antigo SCTE
-    formula = f"{u_code} {t_code}".strip()
-    descricao = f"Clima {u_desc.lower()}, {t_desc.lower()}."
+    formula = f"{u_code} {saz_code} {t_code}".strip()
+    descricao = f"Clima {u_desc.lower()}, {t_desc.lower()}, {saz_desc}."
 
     return {
         "formula": formula,
         "descricao": descricao,
-        "Ih": Ih, "Ia": None, "Im": None,
+        "Ih": Ih, "Ia": Ia, "Im": Im,
         "PET_anual": PET,
         "ETo_verao_mm": ETo_verao,
-        "ETo_verao_sobre_ano": ETo_verao_sobre_ano  # fração 0..1
+        "ETo_verao_sobre_ano": ETo_verao_sobre_ano
     }
 
 # ===== Classificação Köppen–Geiger =====
@@ -494,11 +538,11 @@ if st.session_state.res is not None:
     with c1:
         st.markdown(f"**🌦 Thornthwaite — Fórmula:** `{thorn['formula']}`")
         st.markdown(f"**Descrição:** {thorn['descricao']}")
-        # NOVO: ETo_verão/ETo_ano
         frac = thorn["ETo_verao_sobre_ano"]
         frac_txt = "indefinido" if np.isnan(frac) else f"{frac*100:.1f}%"
         st.markdown(f"**ETo_verão/ETo_ano:** {frac_txt}  "
                     f"(ETo_verão = {thorn['ETo_verao_mm']:.1f} mm; ETo_anual = {thorn['PET_anual']:.1f} mm)")
+        st.caption(f"Índices: Ih={thorn['Ih']:.1f}, Ia={thorn['Ia']:.1f}, Im={thorn['Im']:.1f}")
     with c2:
         st.markdown(f"**🌍 Köppen–Geiger — Fórmula:** `{kopp['formula']}`")
         st.markdown(f"**Descrição:** {kopp['descricao']}")
