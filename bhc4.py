@@ -7,7 +7,7 @@ import pandas as pd
 import math, os, io, zipfile, tempfile, hashlib, requests
 import matplotlib.pyplot as plt
 import re
-import rasterio  # <— necessário para ler GeoTIFFs
+import rasterio  # leitura de GeoTIFFs
 
 # ============== VISUAL ==============
 st.set_page_config(page_title="Balanço Hídrico Climatológico", layout="wide")
@@ -78,7 +78,7 @@ def fotoperiodo_mensal(latitude):
 def eto_thornthwaite(T, latitude):
     """ETo via Thornthwaite com COR = (N/12)*(d/30)."""
     T = np.array(T, dtype=float).copy()
-    # se houver NaN residual (não deve, mas por segurança), trate como 0 para não quebrar
+    # segurança contra NaN residuais
     T = np.where(np.isnan(T), 0.0, T)
     T[T < 0] = 0.0
     i = (T/5.0)**1.514
@@ -132,7 +132,7 @@ def _read_masked_value(src, lon, lat):
     r, c = src.index(lon, lat)  # (x=lon, y=lat)
     if r < 0 or c < 0 or r >= src.height or c >= src.width:
         return np.nan, "fora_bounds"
-    arr = src.read(1, masked=True)  # aplica NoData automaticamente (−32768; −3.4e38 etc.)
+    arr = src.read(1, masked=True)  # aplica NoData automaticamente
     val = arr[r, c]
     if np.ma.is_masked(val):
         return np.nan, "nodata"
@@ -142,7 +142,7 @@ def _read_nearest_valid(src, lon, lat, radii=(3,5,8,12)):
     """Busca valor válido ao redor do ponto (em pixels)."""
     r, c = src.index(lon, lat)
     arr = src.read(1, masked=True)
-    # ponto direto primeiro
+    # ponto direto
     if 0 <= r < src.height and 0 <= c < src.width and not np.ma.is_masked(arr[r, c]):
         return float(arr[r, c]), "ok"
     # janelas crescentes
@@ -155,7 +155,7 @@ def _read_nearest_valid(src, lon, lat, radii=(3,5,8,12)):
     return np.nan, "nodata"
 
 def _detectar_escala_temp(vals_validos):
-    """Retorna 'c_times_10' ou 'celsius' conforme faixa dos valores."""
+    """Retorna 'c_times_10' ou 'celsius' conforme faixa."""
     if len(vals_validos) == 0:
         return "celsius"
     vmin = float(np.nanmin(vals_validos)); vmax = float(np.nanmax(vals_validos))
@@ -164,7 +164,6 @@ def _detectar_escala_temp(vals_validos):
     return "celsius"
 
 def _localizar_tif(pasta: str, prefix: str, m: int):
-    """Procura .tif do mês m (01..12) em QUALQUER subpasta."""
     alvo_mm = f"_{m:02d}.tif".lower()
     pfx = prefix.lower()
     for root, _, files in os.walk(pasta):
@@ -177,8 +176,8 @@ def _localizar_tif(pasta: str, prefix: str, m: int):
 def ler_serie(prefix: str, pasta: str, lon: float, lat: float):
     """
     Lê 12 rasters mensais (01..12) do 'prefix' em qualquer subpasta.
-    - Trata NoData (int16: -32768; float32: ~-3.4e38) via máscara.
-    - Preenche AUTOMATICAMENTE com vizinho mais próximo (janelas 3,5,8,12 px).
+    - Trata NoData via máscara.
+    - Preenche AUTOMATICAMENTE com vizinho mais próximo (3,5,8,12 px).
     - Para temperatura, detecta °C×10 e converte para °C; sanitiza [-90,80].
     - Para precipitação, sanitiza (≥0).
     """
@@ -190,7 +189,6 @@ def ler_serie(prefix: str, pasta: str, lon: float, lat: float):
         with rasterio.open(path) as src:
             v, q = _read_nearest_valid(src, lon, lat, radii=(3,5,8,12))
             if np.isnan(v):
-                # último recurso: tenta valor direto (caso tenha dado ruim em máscara)
                 v, q2 = _read_masked_value(src, lon, lat)
                 q = q if not np.isnan(v) else q2
             vals_raw.append(v); status.append(q)
@@ -213,8 +211,7 @@ def ler_serie(prefix: str, pasta: str, lon: float, lat: float):
     else:
         vals = np.where(np.abs(vals_raw) > 1e6, np.nan, vals_raw)
 
-    # se ainda existir NaN (ponto muito afastado da terra), substitui por 0 para não quebrar fluxo;
-    # você pode preferir manter NaN e exigir preenchimento manual, mas aqui seguimos automação.
+    # fallback final: evita NaN quebrar o fluxo
     if np.isnan(vals).any():
         vals = np.nan_to_num(vals, nan=0.0)
 
@@ -299,7 +296,7 @@ def afericao_ok(df, tol=0.2):
     ]
     return all(checks)
 
-# ===== Classificação Thornthwaite =====
+# ===== Classificação Thornthwaite (com ETo_verao/ETo_ano) =====
 def class_thornthwaite(df, lat):
     soma_ETo = float(df["ETo (Thornthwaite) (mm)"].sum())
     soma_EXC = float(df["EXC (mm)"].sum())
@@ -325,40 +322,14 @@ def class_thornthwaite(df, lat):
         return ("E","Árido")
     u_code, u_desc = umidade(Im)
 
-    DEF = df["DEF (mm)"].to_numpy(float)
-    EXC = df["EXC (mm)"].to_numpy(float)
-    is_summer = np.isin(np.arange(12), [9,10,11,0,1,2]) if lat < 0 else np.isin(np.arange(12), [3,4,5,6,7,8])
-
-    def saz(u_code, Ia, Ih, DEF, EXC, is_summer):
-        if u_code in ["A","B4","B3","B2","B1","C2"]:
-            Ia = 100.0 * (DEF.sum() / soma_ETo) if soma_ETo>0 else np.nan
-            if np.isnan(Ia) or Ia < 16.7: return ("r","baixo déficit ao longo do ano")
-            Ia_sev = "2" if Ia >= 33.3 else ("1" if Ia >= 16.7 else "")
-            def_su = DEF[is_summer].sum(); def_in = DEF[~is_summer].sum()
-            return (f"s{Ia_sev}","déficit maior no verão") if def_su >= def_in else (f"w{Ia_sev}","déficit maior no inverno")
-        else:
-            Ih = 100.0 * (EXC.sum() / soma_ETo) if soma_ETo>0 else np.nan
-            if np.isnan(Ih) or Ih < 10: return ("d","baixo excedente ao longo do ano")
-            Ih_sev = "2" if Ih >= 33.3 else ("1" if Ih >= 10 else "")
-            exc_su = EXC[is_summer].sum(); exc_in = EXC[~is_summer].sum()
-            return (f"s{Ih_sev}","excedente maior no verão") if exc_su >= exc_in else (f"w{Ih_sev}","excedente maior no inverno")
-    saz_code, saz_desc = saz(u_code, None, None, DEF, EXC, is_summer)
-
+    # Verão por hemisfério
+    is_summer = np.isin(np.arange(12), [11,0,1]) if lat < 0 else np.isin(np.arange(12), [5,6,7])
     ETo = df["ETo (Thornthwaite) (mm)"].to_numpy(float)
+    ETo_verao = float(ETo[is_summer].sum())
     PET = soma_ETo
-    SCTE = np.nan if PET<=0 else 100.0 * (np.sort(ETo)[-3:].sum()/PET)
-    def scte(x):
-        if np.isnan(x): return ("","indefinida")
-        if x < 48.0:   return ("a’","evapotranspiração relativamente baixa no verão")
-        if x <= 51.9:  return ("b’4","quase uniforme (~50%)")
-        if x < 56.3:   return ("b’3","ligeiramente verão")
-        if x < 61.6:   return ("b’2","moderadamente verão")
-        if x < 68.0:   return ("b’1","verão marcado")
-        if x < 76.3:   return ("c’2","verão muito marcado")
-        if x < 88.0:   return ("c’1","verão dominante")
-        return ("d’","PET muito concentrada no verão")
-    scte_code, scte_desc = scte(SCTE)
+    ETo_verao_sobre_ano = np.nan if PET <= 0 else ETo_verao / PET  # fração 0..1
 
+    # Térmico (por PET anual) — mantido
     def term(PET):
         if np.isnan(PET): return ("Indef","Indefinido")
         if PET >= 1140:  return ("A’","Megatérmico")
@@ -372,9 +343,18 @@ def class_thornthwaite(df, lat):
         return ("E’","Gelo perpétuo")
     t_code, t_desc = term(PET)
 
-    formula = f"{u_code} {saz_code} {t_code} {scte_code}"
-    descricao = f"Clima {u_desc.lower()}, {t_desc.lower()}, com {saz_desc}; {scte_desc} (SCTE≈{SCTE:.1f}%)."
-    return {"formula": formula, "descricao": descricao, "Ih": Ih, "Ia": None, "Im": None, "PET_anual": PET}
+    # Fórmula SEM o antigo SCTE
+    formula = f"{u_code} {t_code}".strip()
+    descricao = f"Clima {u_desc.lower()}, {t_desc.lower()}."
+
+    return {
+        "formula": formula,
+        "descricao": descricao,
+        "Ih": Ih, "Ia": None, "Im": None,
+        "PET_anual": PET,
+        "ETo_verao_mm": ETo_verao,
+        "ETo_verao_sobre_ano": ETo_verao_sobre_ano  # fração 0..1
+    }
 
 # ===== Classificação Köppen–Geiger =====
 def class_koppen(df, lat):
@@ -445,7 +425,7 @@ if calcular:
         zip_path = download_from_github(GITHUB_ZIP_URL)
         pasta = unzip_cached(zip_path)
 
-        # Leia T e P do único ZIP (procura em subpastas) — já com NoData tratado e preenchimento automático
+        # Séries WorldClim (NoData tratado, temp em °C)
         T_wc = ler_serie("wc2.1_10m_tavg", pasta, lon, lat)
         P_wc = ler_serie("wc2.1_10m_prec", pasta, lon, lat)
 
@@ -514,6 +494,11 @@ if st.session_state.res is not None:
     with c1:
         st.markdown(f"**🌦 Thornthwaite — Fórmula:** `{thorn['formula']}`")
         st.markdown(f"**Descrição:** {thorn['descricao']}")
+        # NOVO: ETo_verão/ETo_ano
+        frac = thorn["ETo_verao_sobre_ano"]
+        frac_txt = "indefinido" if np.isnan(frac) else f"{frac*100:.1f}%"
+        st.markdown(f"**ETo_verão/ETo_ano:** {frac_txt}  "
+                    f"(ETo_verão = {thorn['ETo_verao_mm']:.1f} mm; ETo_anual = {thorn['PET_anual']:.1f} mm)")
     with c2:
         st.markdown(f"**🌍 Köppen–Geiger — Fórmula:** `{kopp['formula']}`")
         st.markdown(f"**Descrição:** {kopp['descricao']}")
@@ -536,6 +521,7 @@ if st.session_state.res is not None:
                     ["CAD (mm)",  info.get("CAD")],
                     ["Thornthwaite - Fórmula", info.get("thorn_formula")],
                     ["Thornthwaite - Descrição", info.get("thorn_desc")],
+                    ["ETo_verão/ETo_ano (%)", info.get("eto_raz_percent")],
                     ["Köppen - Fórmula", info.get("koppen_formula")],
                     ["Köppen - Descrição", info.get("koppen_desc")],
                     ["Gerado em", datetime.now().strftime("%Y-%m-%d %H:%M")],
@@ -545,9 +531,11 @@ if st.session_state.res is not None:
         buf.seek(0)
         return buf.getvalue()
 
+    frac = thorn["ETo_verao_sobre_ano"]
     info_excel = {
         "lat": lat, "lon": lon, "CAD": CAD,
         "thorn_formula": thorn["formula"], "thorn_desc": thorn["descricao"],
+        "eto_raz_percent": ("indefinido" if np.isnan(frac) else f"{frac*100:.1f}%"),
         "koppen_formula": kopp["formula"], "koppen_desc": kopp["descricao"],
     }
     excel_bytes = gerar_excel(df_out, info_excel)
