@@ -1,1 +1,7 @@
-Repositório para o balanco hídrico climatológico
+streamlit
+numpy
+pandas
+matplotlib
+rasterio
+requests
+xlsxwriter
