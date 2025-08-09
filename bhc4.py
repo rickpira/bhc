@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import math, os, io, zipfile, tempfile, hashlib, requests
 import matplotlib.pyplot as plt
+import re
+import rasterio  # <— necessário para ler GeoTIFFs
 
 # ============== VISUAL ==============
 st.set_page_config(page_title="Balanço Hídrico Climatológico", layout="wide")
@@ -76,6 +78,8 @@ def fotoperiodo_mensal(latitude):
 def eto_thornthwaite(T, latitude):
     """ETo via Thornthwaite com COR = (N/12)*(d/30)."""
     T = np.array(T, dtype=float).copy()
+    # se houver NaN residual (não deve, mas por segurança), trate como 0 para não quebrar
+    T = np.where(np.isnan(T), 0.0, T)
     T[T < 0] = 0.0
     i = (T/5.0)**1.514
     I = np.sum(i)
@@ -113,6 +117,52 @@ def unzip_cached(zip_path: str) -> str:
             zf.extractall(outdir)
     return outdir
 
+# ====== AMOSTRAGEM SEGURA WORLDCLIM ======
+def _sanitize_prec(x):
+    if x is None or np.isnan(x): return np.nan
+    if x < 0: return np.nan
+    return float(x)
+
+def _sanitize_temp_c(x):
+    if x is None or np.isnan(x): return np.nan
+    if x < -90 or x > 80: return np.nan
+    return float(x)
+
+def _read_masked_value(src, lon, lat):
+    r, c = src.index(lon, lat)  # (x=lon, y=lat)
+    if r < 0 or c < 0 or r >= src.height or c >= src.width:
+        return np.nan, "fora_bounds"
+    arr = src.read(1, masked=True)  # aplica NoData automaticamente (−32768; −3.4e38 etc.)
+    val = arr[r, c]
+    if np.ma.is_masked(val):
+        return np.nan, "nodata"
+    return float(val), "ok"
+
+def _read_nearest_valid(src, lon, lat, radii=(3,5,8,12)):
+    """Busca valor válido ao redor do ponto (em pixels)."""
+    r, c = src.index(lon, lat)
+    arr = src.read(1, masked=True)
+    # ponto direto primeiro
+    if 0 <= r < src.height and 0 <= c < src.width and not np.ma.is_masked(arr[r, c]):
+        return float(arr[r, c]), "ok"
+    # janelas crescentes
+    for rad in radii:
+        r0, r1 = max(0, r-rad), min(src.height, r+rad+1)
+        c0, c1 = max(0, c-rad), min(src.width, c+rad+1)
+        win = arr[r0:r1, c0:c1]
+        if win.count() > 0:
+            return float(win.compressed()[0]), f"preenchido_vizinho({rad}px)"
+    return np.nan, "nodata"
+
+def _detectar_escala_temp(vals_validos):
+    """Retorna 'c_times_10' ou 'celsius' conforme faixa dos valores."""
+    if len(vals_validos) == 0:
+        return "celsius"
+    vmin = float(np.nanmin(vals_validos)); vmax = float(np.nanmax(vals_validos))
+    if (vmin > -900 and vmax < 900) and (abs(vmin) > 120 or abs(vmax) > 120):
+        return "c_times_10"
+    return "celsius"
+
 def _localizar_tif(pasta: str, prefix: str, m: int):
     """Procura .tif do mês m (01..12) em QUALQUER subpasta."""
     alvo_mm = f"_{m:02d}.tif".lower()
@@ -125,28 +175,50 @@ def _localizar_tif(pasta: str, prefix: str, m: int):
     return None
 
 def ler_serie(prefix: str, pasta: str, lon: float, lat: float):
-    """Lê 12 rasters mensais (01..12) para o `prefix`, em qualquer subpasta."""
-    import rasterio
-    vals, faltantes = [], []
-    for m in range(1,13):
+    """
+    Lê 12 rasters mensais (01..12) do 'prefix' em qualquer subpasta.
+    - Trata NoData (int16: -32768; float32: ~-3.4e38) via máscara.
+    - Preenche AUTOMATICAMENTE com vizinho mais próximo (janelas 3,5,8,12 px).
+    - Para temperatura, detecta °C×10 e converte para °C; sanitiza [-90,80].
+    - Para precipitação, sanitiza (≥0).
+    """
+    vals_raw, status = [], []
+    for m in range(1, 13):
         path = _localizar_tif(pasta, prefix, m)
         if path is None:
-            faltantes.append(m); continue
+            vals_raw.append(np.nan); status.append("arquivo_ausente"); continue
         with rasterio.open(path) as src:
-            r, c = src.index(lon, lat)  # x=lon, y=lat (WGS84)
-            vals.append(float(src.read(1)[r, c]))
-    if faltantes:
-        candidatos = []
-        for root, _, files in os.walk(pasta):
-            for fn in files:
-                if fn.lower().endswith(".tif"):
-                    candidatos.append(os.path.join(root, fn))
-        candidatos = sorted(candidatos)[:10]
-        raise FileNotFoundError(
-            f"Faltaram os meses {faltantes} para prefixo '{prefix}'.\n"
-            "Exemplos de TIFs encontrados:\n- " + "\n- ".join(candidatos)
-        )
-    return np.array(vals, dtype=float)
+            v, q = _read_nearest_valid(src, lon, lat, radii=(3,5,8,12))
+            if np.isnan(v):
+                # último recurso: tenta valor direto (caso tenha dado ruim em máscara)
+                v, q2 = _read_masked_value(src, lon, lat)
+                q = q if not np.isnan(v) else q2
+            vals_raw.append(v); status.append(q)
+
+    vals_raw = np.array(vals_raw, dtype=float)
+
+    # Detectar variável pelo prefixo
+    pfx = prefix.lower()
+    is_temp = any(k in pfx for k in ["tavg", "tmean", "tmin", "tmax", "temp"])
+    is_prec = "prec" in pfx or "ppt" in pfx or "prcp" in pfx
+
+    if is_temp:
+        validos = vals_raw[np.isfinite(vals_raw)]
+        escala = _detectar_escala_temp(validos) if validos.size else "celsius"
+        if escala == "c_times_10":
+            vals_raw = vals_raw / 10.0
+        vals = np.array([_sanitize_temp_c(v) for v in vals_raw], dtype=float)
+    elif is_prec:
+        vals = np.array([_sanitize_prec(v) for v in vals_raw], dtype=float)
+    else:
+        vals = np.where(np.abs(vals_raw) > 1e6, np.nan, vals_raw)
+
+    # se ainda existir NaN (ponto muito afastado da terra), substitui por 0 para não quebrar fluxo;
+    # você pode preferir manter NaN e exigir preenchimento manual, mas aqui seguimos automação.
+    if np.isnan(vals).any():
+        vals = np.nan_to_num(vals, nan=0.0)
+
+    return vals
 
 def bloco_umido_inicio_fim(D, tol=1e-6):
     n = len(D); pos = D >= -tol
@@ -272,7 +344,6 @@ def class_thornthwaite(df, lat):
             return (f"s{Ih_sev}","excedente maior no verão") if exc_su >= exc_in else (f"w{Ih_sev}","excedente maior no inverno")
     saz_code, saz_desc = saz(u_code, None, None, DEF, EXC, is_summer)
 
-    # SCTE — texto ajustado:
     ETo = df["ETo (Thornthwaite) (mm)"].to_numpy(float)
     PET = soma_ETo
     SCTE = np.nan if PET<=0 else 100.0 * (np.sort(ETo)[-3:].sum()/PET)
@@ -288,7 +359,6 @@ def class_thornthwaite(df, lat):
         return ("d’","PET muito concentrada no verão")
     scte_code, scte_desc = scte(SCTE)
 
-    # Térmico (por PET anual)
     def term(PET):
         if np.isnan(PET): return ("Indef","Indefinido")
         if PET >= 1140:  return ("A’","Megatérmico")
@@ -375,7 +445,7 @@ if calcular:
         zip_path = download_from_github(GITHUB_ZIP_URL)
         pasta = unzip_cached(zip_path)
 
-        # Leia T e P do único ZIP (procura em subpastas)
+        # Leia T e P do único ZIP (procura em subpastas) — já com NoData tratado e preenchimento automático
         T_wc = ler_serie("wc2.1_10m_tavg", pasta, lon, lat)
         P_wc = ler_serie("wc2.1_10m_prec", pasta, lon, lat)
 
@@ -416,7 +486,6 @@ if calcular:
         thorn = class_thornthwaite(df_out, lat)
         kopp  = class_koppen(df_out, lat)
 
-        # guarda tudo no estado (persistência após rerun do download)
         st.session_state.res = {
             "df_out": df_out, "inicio_ARM": inicio_ARM,
             "thorn": thorn, "kopp": kopp,
@@ -454,8 +523,7 @@ if st.session_state.res is not None:
     st.dataframe(df_out, use_container_width=True)
     st.caption(f"🔁 Início do ciclo de ARM (após bloco úmido): **{MESES[inicio_ARM]}** — CAD={CAD:.0f} mm")
 
-    # Download Excel (persiste após rerun)
-    import io
+    # Download Excel
     from datetime import datetime
     def gerar_excel(df_bhc: pd.DataFrame, info: dict | None = None) -> bytes:
         buf = io.BytesIO()
