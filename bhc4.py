@@ -1,4 +1,4 @@
-  # app.py — Aplicativo para Cálculo do Balanço Hídrico Climatológico — v1 (corrigido)
+# app.py — Aplicativo para Cálculo do Balanço Hídrico Climatológico — v1 (corrigido)
 # Professores: Claudio Ricardo da Silva (UFU) e Nildo da Silva Dias (UFERSA)
 
 import streamlit as st
@@ -95,14 +95,23 @@ def download_from_github(url: str) -> str:
     os.makedirs(os.path.join(tempfile.gettempdir(), "wc_cache"), exist_ok=True)
     out = os.path.join(tempfile.gettempdir(), "wc_cache", "worldclim_10m.zip")
     if not os.path.exists(out):
-        r = requests.get(url, stream=True, timeout=60)
+        # ALTERAÇÃO: aumentar timeout e permitir token opcional para evitar rate limit
+        headers = {}
+        try:
+            tok = st.secrets.get("GITHUB_TOKEN", None)
+        except Exception:
+            tok = None
+        if tok:
+            headers["Authorization"] = f"token {tok}"
+        r = requests.get(url, stream=True, timeout=180, headers=headers)
         if r.status_code == 404:
             st.error("Arquivo da release não encontrado (404). Verifique o nome do asset.")
             r.raise_for_status()
         r.raise_for_status()
         with open(out, "wb") as f:
             for chunk in r.iter_content(chunk_size=262144):
-                if chunk: f.write(chunk)
+                if chunk:
+                    f.write(chunk)
     return out
 
 @st.cache_data(show_spinner=False)
@@ -477,8 +486,10 @@ def class_koppen_v2(df, lat, use_minus3=True):
 # ============== CÁLCULO (apenas quando clicar) ==============
 if calcular:
     try:
-        zip_path = download_from_github(GITHUB_ZIP_URL)
-        pasta = unzip_cached(zip_path)
+        # ALTERAÇÃO: spinner informativo para o primeiro uso
+        with st.spinner("Baixando e preparando dados base (pode levar até 1–2 min no primeiro acesso)..."):
+            zip_path = download_from_github(GITHUB_ZIP_URL)
+            pasta = unzip_cached(zip_path)
 
         # Séries WorldClim (NoData tratado, temp em °C)
         T_wc = ler_serie("wc2.1_10m_tavg", pasta, lon, lat)
@@ -529,7 +540,9 @@ if calcular:
         }
 
     except Exception as e:
-        st.error(f"Erro: {e}")
+        # ALTERAÇÃO: mostrar traceback completo para depuração
+        st.exception(e)
+        st.error("Falha ao calcular. Veja o traceback acima. Se aparecer 'rate limit', adicione um GITHUB_TOKEN nos Secrets do app.")
 
 # ============== RENDERIZAÇÃO PERSISTENTE ==============
 if st.session_state.res is not None:
@@ -630,4 +643,7 @@ if st.session_state.res is not None:
     ax3.grid(axis='y', linestyle='--', alpha=0.5); ax3.legend()
     st.pyplot(fig3)
 else:
-    st.info("Preencha latitude, longitude e CAD. Depois clique em **Calcular balanço**.")
+     st.info(
+        "Preencha latitude, longitude e CAD. Depois clique em **Calcular balanço**.\n"
+        "Dica: no primeiro acesso pode demorar ~1-2 min para baixar os dados base."
+    )
