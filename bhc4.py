@@ -1,4 +1,4 @@
-# # app.py — Aplicativo para Cálculo do Balanço Hídrico Climatológico — v1
+  # app.py — Aplicativo para Cálculo do Balanço Hídrico Climatológico — v1 (corrigido)
 # Professores: Claudio Ricardo da Silva (UFU) e Nildo da Silva Dias (UFERSA)
 
 import streamlit as st
@@ -362,40 +362,53 @@ def class_thornthwaite(df, lat):
     }
 
 # ===== Köppen–Geiger (Peel et al., 2007) =====
-def class_koppen_v2(df, use_minus3=True):
+# ALTERAÇÃO: assinatura agora recebe lat para usar verão/inverno por hemisfério
+
+def class_koppen_v2(df, lat, use_minus3=True):
     """
-    Implementação Köppen–Geiger seguindo Peel et al. (2007).
-    - Primeira letra: E, B, A, C/D (C/D separados por Tmin < 0°C ou -3°C)
-    - B: Pth = 20*Tbar + ajuste (>=70% da chuva na metade quente: +280; >=70% na fria: +0; senão +140)
-    - A: Af/Am/Aw(As)
-    - C/D: s/w/f + a/b/c
+    Implementação Köppen–Geiger seguindo Peel et al. (2007), com correções:
+    - Grupos A e B usam semestre alto-sol/baixo-sol por hemisfério (verão/inverno fixos).
+    - Grupos C/D mantêm a divisão hot6/cold6 por temperatura.
     """
     T = df["Temperatura Média (°C)"].to_numpy(float)
     P = df["Precipitação (mm)"].to_numpy(float)
+
+    # --- ALTERAÇÃO: índices de verão e inverno por hemisfério ---
+    if lat < 0:  # Hemisfério Sul
+        verao_idx   = np.array([9,10,11,0,1,2])   # Out, Nov, Dez, Jan, Fev, Mar
+        inverno_idx = np.array([3,4,5,6,7,8])     # Abr, Mai, Jun, Jul, Ago, Set
+    else:        # Hemisfério Norte
+        verao_idx   = np.array([3,4,5,6,7,8])     # Abr–Set
+        inverno_idx = np.array([9,10,11,0,1,2])   # Out–Mar
 
     Tbar = float(np.nanmean(T))
     Psum = float(np.nansum(P))
     Tmin = float(np.nanmin(T))
     Tmax = float(np.nanmax(T))
-    months_ge10 = int(np.sum(T >= 10.0))
 
-    # ordenar meses por T para metade quente/fria
-    order = np.argsort(T)[::-1]
-    hot6 = np.zeros(12, dtype=bool); hot6[order[:6]] = True
-    cold6 = ~hot6
-    P_hot = float(np.nansum(P[hot6])); P_cold = float(np.nansum(P[cold6]))
-
-    # E (polar)
+    # ============================
+    # Grupo E (polar)
+    # ============================
     if Tmax < 10.0:
         return {"formula": "EF" if Tmax < 0.0 else "ET",
                 "descricao": "Clima polar de gelo perpétuo" if Tmax < 0.0 else "Clima polar de tundra"}
 
-    # B (árido)
-    frac_hot = (P_hot / Psum) if Psum > 0 else 0.0
-    frac_cold = (P_cold / Psum) if Psum > 0 else 0.0
-    if frac_hot >= 0.70: add = 280.0
-    elif frac_cold >= 0.70: add = 0.0
-    else: add = 140.0
+    # ============================
+    # Grupo B (árido)
+    # ============================
+    # ALTERAÇÃO: ajuste sazonal com verão/inverno fixos
+    P_hot  = float(np.nansum(P[verao_idx]))
+    P_cold = float(np.nansum(P[inverno_idx]))
+    frac_hot = P_hot / Psum if Psum > 0 else 0.0
+    frac_cold = P_cold / Psum if Psum > 0 else 0.0
+
+    if frac_hot >= 0.70:
+        add = 280.0
+    elif frac_cold >= 0.70:
+        add = 0.0
+    else:
+        add = 140.0
+
     Pth = 20.0 * Tbar + add
     if Psum < Pth:
         subtype = "BW" if Psum < 0.5 * Pth else "BS"
@@ -404,20 +417,32 @@ def class_koppen_v2(df, use_minus3=True):
                 "descricao": ("Clima desértico" if subtype=="BW" else "Clima de estepe") +
                              (" quente" if hk=="h" else " frio")}
 
-    # A (tropical)
-    driest = float(np.nanmin(P))
+    # ============================
+    # Grupo A (tropical)
+    # ============================
     if Tmin >= 18.0:
+        driest = float(np.nanmin(P))
         if driest >= 60.0:
             return {"formula": "Af", "descricao": "Tropical úmido, sem estação seca"}
         if driest >= (100.0 - Psum/25.0):
             return {"formula": "Am", "descricao": "Tropical monçônico"}
-        P_dry_summer = float(np.nanmin(P[hot6]))
-        P_dry_winter = float(np.nanmin(P[cold6]))
+
+        # ALTERAÇÃO: Aw vs As pelo semestre correto
+        P_dry_summer = float(np.nanmin(P[verao_idx]))
+        P_dry_winter = float(np.nanmin(P[inverno_idx]))
         dry_in_winter = P_dry_winter <= P_dry_summer
         return {"formula": "Aw" if dry_in_winter else "As",
                 "descricao": "Tropical com estação seca no " + ("inverno" if dry_in_winter else "verão")}
 
-    # C/D (temperado/continental)
+    # ============================
+    # Grupos C/D (temperado/continental)
+    # ============================
+    # Mantém hot6/cold6 por temperatura
+    order = np.argsort(T)[::-1]
+    hot6 = np.zeros(12, dtype=bool); hot6[order[:6]] = True
+    cold6 = ~hot6
+
+    months_ge10 = int(np.sum(T >= 10.0))
     cd_limit = -3.0 if use_minus3 else 0.0
     main = "D" if Tmin < cd_limit else "C"
 
@@ -430,7 +455,7 @@ def class_koppen_v2(df, use_minus3=True):
     is_w = (P_dry_winter < (P_wet_summer / 10.0))
     mid = "s" if is_s else ("w" if is_w else "f")
 
-    if Tmax >= 22.0 and months_ge10 >= 4:
+    if np.nanmax(T) >= 22.0 and months_ge10 >= 4:
         last = "a"
     elif months_ge10 >= 4:
         last = "b"
@@ -494,7 +519,8 @@ if calcular:
         })
 
         thorn = class_thornthwaite(df_out, lat)
-        kopp  = class_koppen_v2(df_out, use_minus3=False)  # use_minus3=True para limiar -3°C
+        # ALTERAÇÃO: passar lat para Köppen
+        kopp  = class_koppen_v2(df_out, lat=lat, use_minus3=False)  # use_minus3=True para limiar -3°C
 
         st.session_state.res = {
             "df_out": df_out, "inicio_ARM": inicio_ARM,
