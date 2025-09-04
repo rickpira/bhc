@@ -12,12 +12,25 @@ import rasterio  # leitura de GeoTIFFs
 # ============== VISUAL ==============
 st.set_page_config(page_title="Balanço Hídrico Climatológico", layout="wide")
 st.markdown("<style>.stApp{background-color:#f5f9f6;}</style>", unsafe_allow_html=True)
-st.markdown("""
+
+autores = [
+    "Claudio Ricardo da Silva (UFU)",
+    "Nildo da Silva Dias (UFERSA)",
+    "Larissa Barbosa de Sousa"
+]
+if len(autores) > 1:
+    autores_html = ", ".join(autores[:-1]) + " e " + autores[-1]
+else:
+    autores_html = autores[0]
+
+st.markdown(f"""
 <h1 style='text-align:center; color:green;'>Aplicativo para Cálculo do Balanço Hídrico Climatológico</h1>
-<h4 style='text-align:center;'>Desenvolvido pelos professores Claudio Ricardo da Silva (UFU) e Nildo da Silva Dias (UFERSA)</h4>
+<h4 style='text-align:center;'>Desenvolvido por {autores_html}</h4>
 <h5 style='text-align:center; color:gray;'>Versão 1</h5>
 """, unsafe_allow_html=True)
+
 st.divider()
+
 
 # ============== ESTADO PERSISTENTE ==============
 if "res" not in st.session_state:
