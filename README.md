@@ -11,6 +11,7 @@ Ele gera tabela completa com todos os componentes do balanço (ARM, ALT, ETR, DE
 
 - **Claudio Ricardo da Silva** – Universidade Federal de Uberlândia (UFU)  
 - **Nildo da Silva Dias** – Universidade Federal Rural do Semi-Árido (UFERSA)
+- **Larissa Barbosa de Sousa - Universidade Federal de Uberlândia (UFU)
 
 ---
 
