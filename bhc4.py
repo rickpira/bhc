@@ -16,7 +16,7 @@ st.markdown("<style>.stApp{background-color:#f5f9f6;}</style>", unsafe_allow_htm
 autores = [
     "Claudio Ricardo da Silva (UFU)",
     "Nildo da Silva Dias (UFERSA)",
-    "Larissa Barbosa de Sousa"
+    "Larissa Barbosa de Sousa (UFU)"
 ]
 if len(autores) > 1:
     autores_html = ", ".join(autores[:-1]) + " e " + autores[-1]
